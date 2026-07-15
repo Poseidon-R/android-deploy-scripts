@@ -4,13 +4,20 @@
 
 ## 接入(作为 submodule 引入)
 
+**新项目引入:**
 ```bash
 git submodule add <本仓库地址> .deploy
 ```
-
 在 `app/build.gradle` 末尾添加:
 ```groovy
 apply from: "$rootDir/.deploy/ftp-upload.gradle"
+```
+
+**克隆已包含本脚本的项目**(否则 `.deploy/` 是空的,`apply from` 会找不到脚本):
+```bash
+git clone --recurse-submodules <项目url>
+# 或已经 clone 过的:
+git submodule update --init --recursive
 ```
 
 ## 配置(在项目 `gradle.properties` 中,全部可选,不配走默认)
@@ -57,3 +64,18 @@ setx FTP_PASSWORD "你的密码"   # Windows,设完重开终端
 
 ## 前提
 release 构建。APK 在 `outputs/apk/release/` 自动查找(支持 `productFlavors` 自定义文件名);多 ABI splits 仍只传第一个。
+
+## 更新脚本
+
+改了 `ftp-upload.gradle` 后,各项目要同步:
+
+```bash
+# 1. 在本仓库提交并推送(可在任意项目的 .deploy/ 目录里改)
+cd .deploy
+git add . && git commit -m "update script" && git push
+cd ..
+
+# 2. 各项目拉取最新(更新 submodule 引用)
+git submodule update --remote .deploy
+git add .deploy && git commit -m "bump deploy submodule"
+```
