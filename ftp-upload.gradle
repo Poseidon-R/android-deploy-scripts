@@ -1,0 +1,296 @@
+import com.jcraft.jsch.ChannelSftp
+import com.jcraft.jsch.JSch
+import com.jcraft.jsch.Session
+import com.jcraft.jsch.SftpException
+import groovy.json.JsonOutput
+import groovy.xml.XmlSlurper
+import org.gradle.api.GradleException
+
+// 通用 SFTP 上传脚本:构建 release APK 后,把 APK + 配置 JSON + 应用图标 + 下载页
+// 一起通过 SFTP(SSH)上传到服务器。各项目通过 gradle.properties 的 upload.ftp.* 覆盖默认配置。
+// 用法:apply from: "<本脚本路径>",然后执行 ./gradlew uploadReleaseApkToFtp
+buildscript {
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.jcraft:jsch:0.1.55'
+    }
+}
+
+// ====== 配置(各项目可在 gradle.properties 用 upload.ftp.* 覆盖)======
+def CFG_HOST      = project.findProperty('upload.ftp.host')         ?: '192.168.3.91'
+def CFG_PORT      = ((project.findProperty('upload.ftp.port'))      ?: '22').toString().toInteger()
+def CFG_USER      = project.findProperty('upload.ftp.user')         ?: 'root'
+def CFG_PWD_ENV   = project.findProperty('upload.ftp.passwordEnv')  ?: 'FTP_PASSWORD'
+// 应用名(从 strings.xml 读),用作默认上传目录名
+def resolveAppName = {
+    def stringsXml = project.file("src/main/res/values/strings.xml")
+    if (stringsXml.exists()) {
+        return (new XmlSlurper().parse(stringsXml).string.find { it.@name == 'app_name' })?.text() ?: null
+    }
+    return null
+}
+def APP_NAME     = resolveAppName()
+def CFG_BASE_DIR = project.findProperty('upload.ftp.baseDir')     ?: "/root/upload/app/${(APP_NAME ?: android.defaultConfig.applicationId).toString().toLowerCase()}"
+def CFG_APK_DIR  = "${CFG_BASE_DIR}/apk"
+// ==================================================================
+
+// 自动探测应用图标:优先 upload.iconPath;否则读 AndroidManifest 的 android:icon,找最高密度 mipmap/drawable 位图
+def resolveIconFile = {
+    def configured = project.findProperty('upload.iconPath')
+    if (configured) {
+        def f = project.file(configured)
+        if (f.exists()) return f
+    }
+    def manifest = project.file("src/main/AndroidManifest.xml")
+    if (manifest.exists()) {
+        def matcher = (manifest.text =~ /android:icon="([^"]+)"/)
+        if (matcher) {
+            def ref = matcher[0][1]
+            if (ref.startsWith('@')) {
+                def seg = ref.substring(1).split('/')
+                if (seg.length == 2 && (seg[0] == 'mipmap' || seg[0] == 'drawable')) {
+                    def type = seg[0], name = seg[1]
+                    for (d in ['xxxhdpi', 'xxhdpi', 'xhdpi', 'hdpi', 'mdpi', '']) {
+                        def dirName = d ? "${type}-${d}" : type
+                        for (ext in ['png', 'webp']) {
+                            def f = project.file("src/main/res/${dirName}/${name}.${ext}")
+                            if (f.exists()) return f
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return null
+}
+
+// 下载页模板(三单引号,Groovy 不做插值,JS 里的 ${} 原样输出)。可用 upload.pageTemplate 指向自定义 html 覆盖。
+def DEFAULT_PAGE = '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>App 下载</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; }
+  .card { background: #fff; border-radius: 24px; box-shadow: 0 20px 60px rgba(0,0,0,0.25); max-width: 420px; width: 100%; padding: 40px 32px; text-align: center; position: relative; min-height: 380px; }
+  .logo img { width: 96px; height: 96px; border-radius: 22px; box-shadow: 0 8px 20px rgba(118, 75, 162, 0.3); margin-bottom: 16px; }
+  .app-name { font-size: 28px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
+  .version { font-size: 16px; color: #888; margin-bottom: 4px; }
+  .date { font-size: 14px; color: #aaa; margin-bottom: 28px; }
+  .download-btn { display: block; width: 100%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; text-decoration: none; padding: 16px; border-radius: 14px; font-size: 17px; font-weight: 600; margin-bottom: 32px; box-shadow: 0 8px 20px rgba(118, 75, 162, 0.4); }
+  .download-btn:active { transform: scale(0.98); }
+  .qr-section { padding-top: 24px; border-top: 1px solid #f0f0f0; }
+  .qr-hint { font-size: 14px; color: #888; margin-bottom: 16px; }
+  .qr-code { display: inline-block; padding: 12px; background: #fff; border: 1px solid #eee; border-radius: 12px; }
+  .qr-code img { display: block; width: 200px; height: 200px; }
+  .qr-label { margin-top: 14px; font-size: 14px; color: #555; font-weight: 500; }
+  .state-container { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; border-radius: 24px; padding: 40px; }
+  .spinner { width: 48px; height: 48px; border: 4px solid #e8e8f0; border-top-color: #667eea; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 20px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .state-text { font-size: 15px; color: #888; }
+  .state-error-icon { font-size: 48px; margin-bottom: 16px; }
+  .state-retry-btn { margin-top: 16px; padding: 10px 28px; background: #667eea; color: #fff; border: none; border-radius: 10px; font-size: 15px; cursor: pointer; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+  <div class="card" id="app">
+    <div id="stateLoading" class="state-container">
+      <div class="spinner"></div>
+      <p class="state-text">正在加载应用信息...</p>
+    </div>
+    <div id="stateError" class="state-container hidden">
+      <div class="state-error-icon">⚠️</div>
+      <p class="state-text" id="errorMessage">加载失败，请检查网络后重试</p>
+      <button class="state-retry-btn" onclick="location.reload()">重新加载</button>
+    </div>
+    <div id="appContent" class="hidden">
+      <div class="logo"><img id="appIcon" src="icon_launcher.png" alt="App Icon"></div>
+      <h1 class="app-name" id="appName">-</h1>
+      <div class="version" id="appVersion">-</div>
+      <div class="date" id="appDate">-</div>
+      <div class="date" id="appCommit">-</div>
+      <a class="download-btn" id="downloadLink" href="apk/app-release.apk" download="app-release.apk">⬇ 下载 APK</a>
+      <div class="qr-section">
+        <div class="qr-hint">扫一扫，手机下载安装</div>
+        <div class="qr-code"><img id="qrCode" src="" alt="扫码下载" /></div>
+        <div class="qr-label" id="qrLabel">-</div>
+      </div>
+    </div>
+  </div>
+<script>
+(async function() {
+  const INFO_PATH = 'app-release.json';
+  const APK_PATH  = 'apk/app-release.apk';
+  const ICON_PATH = 'icon_launcher.png';
+  const stateLoading = document.getElementById('stateLoading');
+  const stateError   = document.getElementById('stateError');
+  const errorMessage = document.getElementById('errorMessage');
+  const appContent   = document.getElementById('appContent');
+  const appIcon      = document.getElementById('appIcon');
+  const appName      = document.getElementById('appName');
+  const appVersion   = document.getElementById('appVersion');
+  const appDate      = document.getElementById('appDate');
+  const appCommit    = document.getElementById('appCommit');
+  const downloadLink = document.getElementById('downloadLink');
+  const qrCode      = document.getElementById('qrCode');
+  const qrLabel     = document.getElementById('qrLabel');
+  function showError(msg) {
+    errorMessage.textContent = msg;
+    stateLoading.classList.add('hidden');
+    stateError.classList.remove('hidden');
+  }
+  try {
+    const infoResp = await fetch(INFO_PATH);
+    if (!infoResp.ok) throw new Error(`app-release.json 加载失败 (HTTP ${infoResp.status})`);
+    const info = await infoResp.json();
+    appName.textContent = info.appName || 'App';
+    appVersion.textContent = info.versionName
+      ? `v${info.versionName}` + (info.versionCode ? ` (build ${info.versionCode})` : '')
+      : '-';
+    if (info.buildTime) {
+      appDate.textContent = `构建时间: ${info.buildTime}`;
+    }
+    if (info.branch || info.commit) {
+      appCommit.textContent = [info.branch, info.commit].filter(Boolean).join(' @ ');
+    }
+    appIcon.src = info.iconPath || ICON_PATH;
+    const pageUrl = window.location.href;
+    const baseUrl = pageUrl.substring(0, pageUrl.lastIndexOf('/') + 1);
+    const apkUrl  = baseUrl + APK_PATH;
+    downloadLink.href = APK_PATH;
+    qrCode.src = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(apkUrl)}`;
+    qrLabel.textContent = `${appName.textContent} ${appVersion.textContent}`;
+    stateLoading.classList.add('hidden');
+    appContent.classList.remove('hidden');
+  } catch (err) {
+    console.error(err);
+    showError(err.message || '加载失败，请检查网络后重试');
+  }
+})();
+</script>
+</body>
+</html>'''
+
+task uploadReleaseApkToFtp {
+    group = 'deploy'
+    description = "构建 release APK 并通过 SFTP 上传 APK/配置JSON/图标/下载页到 ${CFG_HOST}:${CFG_BASE_DIR}"
+
+    dependsOn 'assembleRelease'
+
+    doLast {
+        def password = System.getenv(CFG_PWD_ENV)
+        if (password == null || password.trim().isEmpty()) {
+            throw new GradleException(
+                "未找到环境变量 ${CFG_PWD_ENV}。请先执行: setx ${CFG_PWD_ENV} \"你的密码\" 然后重开终端再运行本任务。"
+            )
+        }
+
+        // 1. release APK(在 release 输出目录自动查找,兼容多 flavor 自定义文件名)
+        def releaseDir = project.file("${buildDir}/outputs/apk/release")
+        def apkFile = releaseDir.listFiles()?.find { it.name.endsWith('.apk') }
+        if (apkFile == null) {
+            apkFile = new File(releaseDir, "app-release.apk")
+        }
+        if (!apkFile.exists()) {
+            throw new GradleException("未找到 release APK: ${releaseDir.absolutePath}，请确认 assembleRelease 已成功执行。")
+        }
+        logger.lifecycle("[SFTP] APK: ${apkFile.name}")
+
+        // 2. 图标(自动探测)
+        def iconFile = resolveIconFile()
+        if (iconFile == null) {
+            throw new GradleException("未找到应用图标。可在 gradle.properties 配置 upload.iconPath，或确保 AndroidManifest 的 android:icon 指向存在的 mipmap/drawable 位图。")
+        }
+
+        // 3. 生成配置 JSON(App名称 / 版本号 / 构建时间 / git 提交 / 分支)
+        def gitInfo = { String cmd ->
+            try {
+                def p = cmd.execute(null, project.rootDir)
+                p.waitFor()
+                return p.text.trim()
+            } catch (Exception ignored) {
+                return ""
+            }
+        }
+        def info = [
+            appName     : APP_NAME ?: "Unknown",
+            versionName : android.defaultConfig.versionName,
+            versionCode : android.defaultConfig.versionCode,
+            buildTime   : new Date().format('yyyy-MM-dd HH:mm:ss'),
+            commit      : gitInfo("git rev-parse --short HEAD"),
+            branch      : gitInfo("git rev-parse --abbrev-ref HEAD")
+        ]
+        def tmpDir = project.file("${buildDir}/tmp/deploy")
+        tmpDir.mkdirs()
+        def jsonTmp = new File(tmpDir, "app-release.json")
+        jsonTmp.text = JsonOutput.prettyPrint(JsonOutput.toJson(info))
+        logger.lifecycle("[SFTP] 配置JSON: ${jsonTmp.text}")
+
+        // 4. 下载页(默认内置;可用 upload.pageTemplate 指向自定义 html 覆盖)
+        def pageTemplate = project.findProperty('upload.pageTemplate')
+        def indexTmp = new File(tmpDir, "index.html")
+        indexTmp.text = pageTemplate ? project.file(pageTemplate).text : DEFAULT_PAGE
+
+        // 5. 连接 SFTP 并上传
+        logger.lifecycle("[SFTP] 目标: ${CFG_USER}@${CFG_HOST}:${CFG_PORT}  base=${CFG_BASE_DIR}")
+
+        Session session = null
+        ChannelSftp channel = null
+        try {
+            JSch jsch = new JSch()
+            session = jsch.getSession(CFG_USER, CFG_HOST, CFG_PORT)
+            session.setPassword(password)
+            session.setConfig("StrictHostKeyChecking", "no")
+            session.setConfig("PreferredAuthentications", "password")
+            session.connect(15000)
+            logger.lifecycle("[SFTP] SSH 连接成功")
+
+            channel = (ChannelSftp) session.openChannel("sftp")
+            channel.connect(15000)
+            logger.lifecycle("[SFTP] SFTP 通道已建立")
+
+            def ensureRemoteDir = { String dir ->
+                channel.cd("/")
+                dir.split("/").findAll { it }.each { part ->
+                    try {
+                        channel.cd(part)
+                    } catch (SftpException ignored) {
+                        channel.mkdir(part)
+                        channel.cd(part)
+                    }
+                }
+            }
+            def uploadOne = { File local, String remoteDir, String remoteName ->
+                ensureRemoteDir(remoteDir)
+                long localSize = local.length()
+                local.withInputStream { is ->
+                    channel.put(is, remoteName, ChannelSftp.OVERWRITE)
+                }
+                long remoteSize = channel.stat(remoteName).getSize()
+                if (remoteSize != localSize) {
+                    throw new GradleException("上传大小不一致: ${remoteDir}/${remoteName} local=${localSize}, remote=${remoteSize}")
+                }
+                logger.lifecycle("[SFTP] 已上传: ${remoteDir}/${remoteName} (${localSize} bytes)")
+            }
+
+            uploadOne(apkFile,  CFG_APK_DIR,   "app-release.apk")
+            uploadOne(jsonTmp,  CFG_BASE_DIR,  "app-release.json")
+            uploadOne(iconFile, CFG_BASE_DIR,  "icon_launcher.png")
+            uploadOne(indexTmp, CFG_BASE_DIR,  "index.html")
+
+            logger.lifecycle("[SFTP] 全部上传完成")
+        } catch (Exception e) {
+            throw new GradleException("SFTP 上传失败: ${e.message}", e)
+        } finally {
+            try { if (channel != null && channel.isConnected()) channel.disconnect() } catch (Exception ignored) {}
+            try { if (session != null && session.isConnected()) session.disconnect() } catch (Exception ignored) {}
+        }
+    }
+}
