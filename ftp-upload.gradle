@@ -1,13 +1,17 @@
+
+
 import com.jcraft.jsch.ChannelSftp
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.SftpException
 import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import groovy.xml.XmlSlurper
 import org.gradle.api.GradleException
 
-// 通用 SFTP 上传脚本:构建 release APK 后,把 APK + 配置 JSON + 应用图标 + 下载页
-// 一起通过 SFTP(SSH)上传到服务器。各项目通过 gradle.properties 的 upload.ftp.* 覆盖默认配置。
+// 通用 SFTP 上传脚本:构建 release APK 后,把 APK + 配置 JSON + 应用图标 + 下载页 + 版本清单
+// 一起通过 SFTP(SSH)上传到服务器。支持多版本:每次构建归档一份快照,下载页展示最新版 + 历史版本列表。
+// 各项目通过 gradle.properties 的 upload.ftp.* / upload.version.* 覆盖默认配置。
 // 用法:apply from: "<本脚本路径>",然后执行 ./gradlew uploadReleaseApkToFtp
 buildscript {
     repositories {
@@ -21,9 +25,10 @@ buildscript {
 }
 
 // ====== 配置(各项目可在 gradle.properties 用 upload.ftp.* 覆盖)======
-def CFG_HOST      = project.findProperty('upload.ftp.host')         ?: '192.168.3.91'
-def CFG_PORT      = ((project.findProperty('upload.ftp.port'))      ?: '22').toString().toInteger()
-def CFG_USER      = project.findProperty('upload.ftp.user')         ?: 'root'
+// 隐私配置(host/port/user)不写死默认值,从 gradle.properties 或环境变量读,未配置则执行时报错
+def CFG_HOST      = project.findProperty('upload.ftp.host') ?: System.getenv('UPLOAD_FTP_HOST')
+def CFG_PORT      = (project.findProperty('upload.ftp.port') ?: System.getenv('UPLOAD_FTP_PORT'))?.toString()?.toInteger()
+def CFG_USER      = project.findProperty('upload.ftp.user') ?: System.getenv('UPLOAD_FTP_USER')
 def CFG_PWD_ENV   = project.findProperty('upload.ftp.passwordEnv')  ?: 'FTP_PASSWORD'
 // 应用名(从 strings.xml 读),用作默认上传目录名
 def resolveAppName = {
@@ -36,6 +41,9 @@ def resolveAppName = {
 def APP_NAME     = resolveAppName()
 def CFG_BASE_DIR = project.findProperty('upload.ftp.baseDir')     ?: "/root/upload/app/${(APP_NAME ?: android.defaultConfig.applicationId).toString().toLowerCase()}"
 def CFG_APK_DIR  = "${CFG_BASE_DIR}/apk"
+def CFG_ARCHIVE_DIR = "${CFG_APK_DIR}/archive"
+// 多版本:保留最近 N 个历史归档版本,0 = 保留全部不清理
+def CFG_KEEP_MAX = ((project.findProperty('upload.version.keepMax'))  ?: '5').toString().toInteger()
 // ==================================================================
 
 // 自动探测应用图标:优先 upload.iconPath;否则读 AndroidManifest 的 android:icon,找最高密度 mipmap/drawable 位图
@@ -82,14 +90,25 @@ def DEFAULT_PAGE = '''<!DOCTYPE html>
   .logo img { width: 96px; height: 96px; border-radius: 22px; box-shadow: 0 8px 20px rgba(118, 75, 162, 0.3); margin-bottom: 16px; }
   .app-name { font-size: 28px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
   .version { font-size: 16px; color: #888; margin-bottom: 4px; }
-  .date { font-size: 14px; color: #aaa; margin-bottom: 28px; }
-  .download-btn { display: block; width: 100%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; text-decoration: none; padding: 16px; border-radius: 14px; font-size: 17px; font-weight: 600; margin-bottom: 32px; box-shadow: 0 8px 20px rgba(118, 75, 162, 0.4); }
+  .date { font-size: 14px; color: #aaa; margin-bottom: 4px; }
+  .last { margin-bottom: 28px; }
+  .download-btn { display: block; width: 100%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; text-decoration: none; padding: 16px; border-radius: 14px; font-size: 17px; font-weight: 600; margin-bottom: 24px; box-shadow: 0 8px 20px rgba(118, 75, 162, 0.4); }
   .download-btn:active { transform: scale(0.98); }
-  .qr-section { padding-top: 24px; border-top: 1px solid #f0f0f0; }
+  .qr-section { padding-top: 20px; border-top: 1px solid #f0f0f0; }
   .qr-hint { font-size: 14px; color: #888; margin-bottom: 16px; }
   .qr-code { display: inline-block; padding: 12px; background: #fff; border: 1px solid #eee; border-radius: 12px; }
   .qr-code img { display: block; width: 200px; height: 200px; }
   .qr-label { margin-top: 14px; font-size: 14px; color: #555; font-weight: 500; }
+  .history-section { margin-top: 24px; padding-top: 20px; border-top: 1px solid #f0f0f0; }
+  .history-title { font-size: 15px; font-weight: 600; color: #555; margin-bottom: 12px; text-align: left; }
+  .history-list { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow-y: auto; }
+  .history-item { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #f8f8fc; border-radius: 10px; text-decoration: none; transition: background 0.15s; }
+  .history-item:hover { background: #eef0f8; }
+  .history-item-info { text-align: left; }
+  .history-item-ver { font-size: 14px; font-weight: 600; color: #1a1a2e; }
+  .history-item-meta { font-size: 12px; color: #999; margin-top: 2px; }
+  .history-item-dl { font-size: 13px; color: #667eea; font-weight: 600; white-space: nowrap; }
+  .history-empty { font-size: 13px; color: #aaa; text-align: center; padding: 12px 0; }
   .state-container { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; border-radius: 24px; padding: 40px; }
   .spinner { width: 48px; height: 48px; border: 4px solid #e8e8f0; border-top-color: #667eea; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 20px; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -115,19 +134,22 @@ def DEFAULT_PAGE = '''<!DOCTYPE html>
       <h1 class="app-name" id="appName">-</h1>
       <div class="version" id="appVersion">-</div>
       <div class="date" id="appDate">-</div>
-      <div class="date" id="appCommit">-</div>
+      <div class="date last" id="appCommit">-</div>
       <a class="download-btn" id="downloadLink" href="apk/app-release.apk" download="app-release.apk">⬇ 下载 APK</a>
       <div class="qr-section">
         <div class="qr-hint">扫一扫，手机下载安装</div>
         <div class="qr-code"><img id="qrCode" src="" alt="扫码下载" /></div>
         <div class="qr-label" id="qrLabel">-</div>
       </div>
+      <div class="history-section">
+        <div class="history-title">历史版本</div>
+        <div class="history-list" id="historyList"></div>
+      </div>
     </div>
   </div>
 <script>
 (async function() {
-  const INFO_PATH = 'app-release.json';
-  const APK_PATH  = 'apk/app-release.apk';
+  const VERSIONS_PATH = 'versions.json';
   const ICON_PATH = 'icon_launcher.png';
   const stateLoading = document.getElementById('stateLoading');
   const stateError   = document.getElementById('stateError');
@@ -141,32 +163,60 @@ def DEFAULT_PAGE = '''<!DOCTYPE html>
   const downloadLink = document.getElementById('downloadLink');
   const qrCode      = document.getElementById('qrCode');
   const qrLabel     = document.getElementById('qrLabel');
+  const historyList = document.getElementById('historyList');
   function showError(msg) {
     errorMessage.textContent = msg;
     stateLoading.classList.add('hidden');
     stateError.classList.remove('hidden');
   }
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  }
   try {
-    const infoResp = await fetch(INFO_PATH);
-    if (!infoResp.ok) throw new Error(`app-release.json 加载失败 (HTTP ${infoResp.status})`);
-    const info = await infoResp.json();
-    appName.textContent = info.appName || 'App';
-    appVersion.textContent = info.versionName
-      ? `v${info.versionName}` + (info.versionCode ? ` (build ${info.versionCode})` : '')
+    const resp = await fetch(VERSIONS_PATH);
+    if (!resp.ok) throw new Error(`versions.json 加载失败 (HTTP ${resp.status})`);
+    const data = await resp.json();
+    const current = data.current || {};
+    const allVersions = Array.isArray(data.versions) ? data.versions : [];
+    // 历史列表不重复显示当前(最新)版本,只列历史归档(按版本号去重)
+    const versions = allVersions.filter((v) => v.versionName !== current.versionName);
+
+    appName.textContent = current.appName || 'App';
+    appVersion.textContent = current.versionName
+      ? `v${current.versionName}` + (current.versionCode ? ` (build ${current.versionCode})` : '')
       : '-';
-    if (info.buildTime) {
-      appDate.textContent = `构建时间: ${info.buildTime}`;
+    if (current.buildTime) {
+      appDate.textContent = `构建时间: ${current.buildTime}`;
     }
-    if (info.branch || info.commit) {
-      appCommit.textContent = [info.branch, info.commit].filter(Boolean).join(' @ ');
+    if (current.branch || current.commit) {
+      appCommit.textContent = [current.branch, current.commit].filter(Boolean).join(' @ ');
     }
-    appIcon.src = info.iconPath || ICON_PATH;
+    appIcon.src = ICON_PATH;
     const pageUrl = window.location.href;
     const baseUrl = pageUrl.substring(0, pageUrl.lastIndexOf('/') + 1);
-    const apkUrl  = baseUrl + APK_PATH;
-    downloadLink.href = APK_PATH;
+    const apkPath = current.apkPath || 'apk/app-release.apk';
+    downloadLink.href = apkPath;
+    const apkUrl = baseUrl + apkPath;
     qrCode.src = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(apkUrl)}`;
     qrLabel.textContent = `${appName.textContent} ${appVersion.textContent}`;
+
+    if (versions.length === 0) {
+      historyList.innerHTML = '<div class="history-empty">暂无历史版本</div>';
+    } else {
+      historyList.innerHTML = versions.map((v) => {
+        const ver = v.versionName ? `v${v.versionName}` : '-';
+        const meta = [v.buildTime, v.commit].filter(Boolean).join(' · ');
+        const path = v.apkPath || '#';
+        return `<a class="history-item" href="${escapeHtml(path)}" download="">
+          <div class="history-item-info">
+            <div class="history-item-ver">${escapeHtml(ver)}</div>
+            <div class="history-item-meta">${escapeHtml(meta)}</div>
+          </div>
+          <div class="history-item-dl">下载</div>
+        </a>`;
+      }).join('');
+    }
+
     stateLoading.classList.add('hidden');
     appContent.classList.remove('hidden');
   } catch (err) {
@@ -180,11 +230,22 @@ def DEFAULT_PAGE = '''<!DOCTYPE html>
 
 task uploadReleaseApkToFtp {
     group = 'deploy'
-    description = "构建 release APK 并通过 SFTP 上传 APK/配置JSON/图标/下载页到 ${CFG_HOST}:${CFG_BASE_DIR}"
+    description = "构建 release APK 并通过 SFTP 上传 APK/配置JSON/图标/下载页/版本清单到 ${CFG_HOST}:${CFG_BASE_DIR}"
 
     dependsOn 'assembleRelease'
 
     doLast {
+        // 隐私配置必填校验(不写死默认值)
+        if (CFG_HOST == null || CFG_HOST.toString().trim().isEmpty()) {
+            throw new GradleException("未配置 SFTP 地址。请在 gradle.properties 设 upload.ftp.host,或设环境变量 UPLOAD_FTP_HOST。")
+        }
+        if (CFG_PORT == null) {
+            throw new GradleException("未配置 SFTP 端口。请在 gradle.properties 设 upload.ftp.port,或设环境变量 UPLOAD_FTP_PORT。")
+        }
+        if (CFG_USER == null || CFG_USER.toString().trim().isEmpty()) {
+            throw new GradleException("未配置 SFTP 用户名。请在 gradle.properties 设 upload.ftp.user,或设环境变量 UPLOAD_FTP_USER。")
+        }
+
         def password = System.getenv(CFG_PWD_ENV)
         if (password == null || password.trim().isEmpty()) {
             throw new GradleException(
@@ -209,7 +270,7 @@ task uploadReleaseApkToFtp {
             throw new GradleException("未找到应用图标。可在 gradle.properties 配置 upload.iconPath，或确保 AndroidManifest 的 android:icon 指向存在的 mipmap/drawable 位图。")
         }
 
-        // 3. 生成配置 JSON(App名称 / 版本号 / 构建时间 / git 提交 / 分支)
+        // 3. 版本信息 + 归档目录名(秒级时间戳保证唯一)
         def gitInfo = { String cmd ->
             try {
                 def p = cmd.execute(null, project.rootDir)
@@ -219,24 +280,49 @@ task uploadReleaseApkToFtp {
                 return ""
             }
         }
-        def info = [
+        def now = new Date()
+        def buildTimeStr = now.format('yyyy-MM-dd HH:mm:ss')
+        def versionName = android.defaultConfig.versionName ?: 'unknown'
+        def safeVersion = versionName.replaceAll('[^a-zA-Z0-9.-]', '_')
+        def versionDir = "v${safeVersion}"
+        def commit = gitInfo("git rev-parse --short HEAD")
+        def branch = gitInfo("git rev-parse --abbrev-ref HEAD")
+
+        // 最新版元信息(根目录 app-release.json + versions.json.current)
+        def currentInfo = [
             appName     : APP_NAME ?: "Unknown",
-            versionName : android.defaultConfig.versionName,
+            versionName : versionName,
             versionCode : android.defaultConfig.versionCode,
-            buildTime   : new Date().format('yyyy-MM-dd HH:mm:ss'),
-            commit      : gitInfo("git rev-parse --short HEAD"),
-            branch      : gitInfo("git rev-parse --abbrev-ref HEAD")
+            buildTime   : buildTimeStr,
+            commit      : commit,
+            branch      : branch,
+            apkPath     : "apk/app-release.apk"
         ]
+        // 归档记录(versions.json.versions 的一条,apkPath 指向归档 APK)
+        def versionEntry = [
+            appName     : currentInfo.appName,
+            versionName : currentInfo.versionName,
+            versionCode : currentInfo.versionCode,
+            buildTime   : buildTimeStr,
+            commit      : commit,
+            branch      : branch,
+            archiveDir  : "apk/archive/${versionDir}",
+            apkPath     : "apk/archive/${versionDir}/app-release.apk"
+        ]
+
         def tmpDir = project.file("${buildDir}/tmp/deploy")
         tmpDir.mkdirs()
         def jsonTmp = new File(tmpDir, "app-release.json")
-        jsonTmp.text = JsonOutput.prettyPrint(JsonOutput.toJson(info))
+        jsonTmp.write(JsonOutput.prettyPrint(JsonOutput.toJson(currentInfo)), "UTF-8")
+        def archiveJsonTmp = new File(tmpDir, "app-release-archive.json")
+        archiveJsonTmp.write(JsonOutput.prettyPrint(JsonOutput.toJson(versionEntry)), "UTF-8")
         logger.lifecycle("[SFTP] 配置JSON: ${jsonTmp.text}")
+        logger.lifecycle("[SFTP] 本次归档: ${versionDir}")
 
         // 4. 下载页(默认内置;可用 upload.pageTemplate 指向自定义 html 覆盖)
         def pageTemplate = project.findProperty('upload.pageTemplate')
         def indexTmp = new File(tmpDir, "index.html")
-        indexTmp.text = pageTemplate ? project.file(pageTemplate).text : DEFAULT_PAGE
+        indexTmp.write(pageTemplate ? project.file(pageTemplate).getText("UTF-8") : DEFAULT_PAGE, "UTF-8")
 
         // 5. 连接 SFTP 并上传
         logger.lifecycle("[SFTP] 目标: ${CFG_USER}@${CFG_HOST}:${CFG_PORT}  base=${CFG_BASE_DIR}")
@@ -280,12 +366,81 @@ task uploadReleaseApkToFtp {
                 logger.lifecycle("[SFTP] 已上传: ${remoteDir}/${remoteName} (${localSize} bytes)")
             }
 
-            uploadOne(apkFile,  CFG_APK_DIR,   "app-release.apk")
-            uploadOne(jsonTmp,  CFG_BASE_DIR,  "app-release.json")
-            uploadOne(iconFile, CFG_BASE_DIR,  "icon_launcher.png")
-            uploadOne(indexTmp, CFG_BASE_DIR,  "index.html")
+            // 5.1 读取远程已有的版本清单(首次上传时不存在)
+            def remoteVersionsJson = "${CFG_BASE_DIR}/versions.json"
+            List existingVersions = []
+            try {
+                def out = new ByteArrayOutputStream()
+                channel.get(remoteVersionsJson, out)
+                def parsed = new JsonSlurper().parseText(out.toString("UTF-8"))
+                if (parsed instanceof Map && parsed.versions instanceof List) {
+                    existingVersions = (List) parsed.versions
+                }
+            } catch (SftpException ignored) {
+                // 首次上传,远程尚无 versions.json
+            } catch (Exception e) {
+                // versions.json 存在但解析失败(可能损坏),忽略并从空清单重建
+                logger.warn("[SFTP] 远程 versions.json 解析失败,将重建清单: ${e.message}")
+            }
 
-            logger.lifecycle("[SFTP] 全部上传完成")
+            // 5.2 合并:同版本号覆盖(移除与本次相同的旧记录),本次插到头部,按 keepMax 截断
+            def mergedVersions = [versionEntry] + existingVersions.findAll { it.versionName != versionEntry.versionName }
+            def removedEntries = []
+            if (CFG_KEEP_MAX > 0 && mergedVersions.size() > CFG_KEEP_MAX) {
+                removedEntries = mergedVersions.drop(CFG_KEEP_MAX)
+                mergedVersions = mergedVersions.take(CFG_KEEP_MAX)
+            }
+
+            // 5.3 上传文件
+            //    根目录:最新版 APK / 最新版 JSON / 图标 / 下载页 / 版本清单
+            //    归档目录:本次 APK + 本次 JSON(保留各版本快照)
+            uploadOne(apkFile,        CFG_APK_DIR,                        "app-release.apk")
+            uploadOne(apkFile,        "${CFG_ARCHIVE_DIR}/${versionDir}", "app-release.apk")
+            uploadOne(archiveJsonTmp, "${CFG_ARCHIVE_DIR}/${versionDir}", "app-release.json")
+            uploadOne(jsonTmp,        CFG_BASE_DIR,                       "app-release.json")
+            uploadOne(iconFile,       CFG_BASE_DIR,                       "icon_launcher.png")
+
+            // 5.4 清理超出 keepMax 的旧归档目录(递归删除)
+            if (removedEntries) {
+                def rmrfDir
+                rmrfDir = { String absDir ->
+                    try {
+                        def entries = channel.ls(absDir)
+                        entries.each { e ->
+                            if (e.filename != "." && e.filename != "..") {
+                                def child = absDir + "/" + e.filename
+                                if (e.attrs.isDir()) {
+                                    rmrfDir(child)
+                                } else {
+                                    channel.rm(child)
+                                }
+                            }
+                        }
+                        channel.rmdir(absDir)
+                        logger.lifecycle("[SFTP] 已清理归档目录: ${absDir}")
+                    } catch (SftpException ignored) {
+                        // 目录可能已不存在,忽略
+                    }
+                }
+                removedEntries.each { e ->
+                    rmrfDir("${CFG_BASE_DIR}/${e.archiveDir}")
+                }
+            }
+
+            // 5.5 版本清单(清理后落盘,反映最终状态)
+            def versionsObj = [
+                current : currentInfo,
+                versions: mergedVersions
+            ]
+            def versionsTmp = new File(tmpDir, "versions.json")
+            versionsTmp.write(JsonOutput.prettyPrint(JsonOutput.toJson(versionsObj)), "UTF-8")
+            uploadOne(versionsTmp, CFG_BASE_DIR, "versions.json")
+
+            // 5.6 下载页
+            uploadOne(indexTmp, CFG_BASE_DIR, "index.html")
+
+            logger.lifecycle("[SFTP] 全部上传完成,历史共 ${mergedVersions.size()} 个版本" +
+                (removedEntries ? "(本次清理 ${removedEntries.size()} 个,keepMax=${CFG_KEEP_MAX})" : ""))
         } catch (Exception e) {
             throw new GradleException("SFTP 上传失败: ${e.message}", e)
         } finally {

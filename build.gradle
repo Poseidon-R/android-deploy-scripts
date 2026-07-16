@@ -1,0 +1,86 @@
+plugins {
+    id 'groovy'
+    id 'java-gradle-plugin'
+    id 'maven-publish'
+    id 'signing'
+}
+
+group = GROUP
+version = VERSION
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+    withSourcesJar()
+    // Maven Central 要求 javadoc jar;Groovy 项目用 groovydoc,本地验证若失败可临时注释
+    withJavadocJar()
+}
+
+repositories {
+    maven { url 'https://maven.aliyun.com/repository/public' }
+    mavenCentral()
+}
+
+dependencies {
+    // jsch 随插件走,各引入项目无需再配 buildscript classpath
+    implementation 'com.jcraft:jsch:0.1.55'
+}
+
+gradlePlugin {
+    website = POM_URL
+    vcsUrl = POM_SCM_URL
+    plugins {
+        sftpUpload {
+            id = PLUGIN_ID
+            implementationClass = 'io.github.poseidon_r.deploy.DeployPlugin'
+            displayName = POM_NAME
+            description = POM_DESCRIPTION
+            tags.set(['android', 'sftp', 'deploy', 'release'])
+        }
+    }
+}
+
+// java-gradle-plugin 自动创建 pluginMaven publication(含 JAR + sources + javadoc + 插件 marker),
+// 这里只补充 POM 元信息(name/desc/license/scm 等,Maven Central 要求)
+publishing {
+    publications {
+        pluginMaven(MavenPublication) {
+            pom {
+                name = POM_NAME
+                description = POM_DESCRIPTION
+                url = POM_URL
+                licenses {
+                    license {
+                        name = POM_LICENCE_NAME
+                        url = POM_LICENCE_URL
+                    }
+                }
+                developers {
+                    developer {
+                        id = POM_DEVELOPER_ID
+                        name = POM_DEVELOPER_NAME
+                    }
+                }
+                scm {
+                    url = POM_SCM_URL
+                    connection = POM_SCM_CONNECTION
+                    developerConnection = POM_SCM_DEV_CONNECTION
+                }
+            }
+        }
+    }
+    // 发布到 Maven Central:旧 OSSRH(s01.oss.sonatype.org)已于 2025-06 停用。
+    // 新流程用 Sonatype Central Portal(central.sonatype.com)网页上传 deployment bundle(ZIP):
+    //   1. 配好 GPG 凭证(~/.gradle/gradle.properties 的 signing.*)
+    //   2. ./gradlew publishToMavenLocal   生成签名 artifact + checksums 到 ~/.m2
+    //   3. cd ~/.m2/repository && zip -r bundle.zip io/github/poseidon-r/
+    //   4. Central Portal 网页 Upload bundle.zip -> Publish
+    // 如需 Gradle 自动 publish,可后续接入 Central Portal API(见 Portal 文档)
+}
+
+// GPG 签名(Maven Central 强制)。required=false:本地无 GPG key 时跳过,publishToMavenLocal 可跑;
+// 发布到 Sonatype 前请在 ~/.gradle/gradle.properties 配置 signing.* (见 gradle.properties 注释)
+signing {
+    required = false
+    sign publishing.publications
+}
