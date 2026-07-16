@@ -14,6 +14,11 @@
 ```groovy
 pluginManagement {
     repositories {
+        mavenCentral{
+            content {
+                includeGroup 'io.github.poseidon-r'
+            }
+        }
         gradlePluginPortal()
         mavenCentral()
     }
