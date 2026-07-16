@@ -44,7 +44,7 @@ gradlePlugin {
 // 这里只补充 POM 元信息(name/desc/license/scm 等,Maven Central 要求)
 publishing {
     publications {
-        pluginMaven(MavenPublication) {
+        withType(MavenPublication) {
             pom {
                 name = POM_NAME
                 description = POM_DESCRIPTION
@@ -84,3 +84,70 @@ signing {
     required = false
     sign publishing.publications
 }
+
+// 自动化发布到 Sonatype Central Portal:打包 deployment bundle(含 GPG 签名 + checksums)并 POST 到 Portal API
+// 用法:~/.gradle/gradle.properties 配 centralPortalUsername/centralPortalPassword 后执行 ./gradlew publishToCentralPortal
+// (Token 在 Portal -> Account -> User Token 生成)
+tasks.register('publishToCentralPortal') {
+    dependsOn 'publishToMavenLocal'
+    group = 'publishing'
+    description = '打包 bundle 并 POST 到 Sonatype Central Portal API(需 centralPortalUsername/Password)'
+    doLast {
+        def tokenUser = findProperty('centralPortalUsername')
+        def tokenPass = findProperty('centralPortalPassword')
+        if (!tokenUser || !tokenPass) {
+            throw new GradleException("未配置 Central Portal User Token。在 ~/.gradle/gradle.properties 设:\n  centralPortalUsername=<User Token 用户名>\n  centralPortalPassword=<User Token 密码>\n(Portal -> Account -> User Token 生成)")
+        }
+        def m2 = new File(System.getProperty('user.home'), '.m2/repository')
+        def base = new File(m2, "${GROUP.replace('.', '/')}/${POM_ARTIFACT_ID}")
+        if (!base.exists()) throw new GradleException("未找到 artifact: ${base}(确认 publishToMavenLocal 已执行)")
+        // 1. 生成 checksums(md5/sha1/sha256/sha512) for 每个 artifact(含 .asc,排除 xml metadata)
+        def allFiles = []
+        base.eachFileRecurse { if (it.file) allFiles << it }
+        allFiles.each { f ->
+            if (!(f.name ==~ /.*\.(md5|sha1|sha256|sha512)$/) && !f.name.endsWith('.xml')) {
+                def data = f.bytes
+                ['md5', 'sha1', 'sha256', 'sha512'].each { algo ->
+                    def cs = java.security.MessageDigest.getInstance(algo).digest(data).encodeHex().toString()
+                    new File(f.absolutePath + '.' + algo).text = cs + '\n'
+                }
+            }
+        }
+        // 2. 打包 deployment bundle ZIP(排除 maven-metadata-local.xml)
+        def bundle = new File(project.buildDir, "bundle-${VERSION}.zip")
+        bundle.parentFile.mkdirs()
+        def zos = new java.util.zip.ZipOutputStream(new FileOutputStream(bundle))
+        base.eachFileRecurse { f ->
+            if (f.file && f.name != 'maven-metadata-local.xml') {
+                def rel = m2.toPath().relativize(f.toPath()).toString().replace(File.separatorChar, '/' as char)
+                zos.putNextEntry(new java.util.zip.ZipEntry(rel))
+                zos.write(f.bytes)
+                zos.closeEntry()
+            }
+        }
+        zos.close()
+        logger.lifecycle("[Central] bundle: ${bundle.name} (${bundle.length()} bytes)")
+        // 3. 上传 bundle(POST /api/v1/publisher/upload)
+        def pb = new ProcessBuilder('curl', '-s', '-S', '-u', "${tokenUser}:${tokenPass}",
+                '-F', "bundle=@${bundle.absolutePath}", 'https://central.sonatype.com/api/v1/publisher/upload')
+        pb.redirectErrorStream(true)
+        def proc = pb.start()
+        def resp = proc.inputStream.text
+        proc.waitFor()
+        logger.lifecycle("[Central] upload 响应: ${resp}")
+        if (proc.exitValue() != 0) throw new GradleException("上传失败(curl exit ${proc.exitValue()}):\n${resp}")
+        // 4. 解析 deploymentId 并 publish(POST /api/v1/publisher/deployment/{id})
+        def deploymentId = resp.trim()
+        if (!deploymentId) throw new GradleException("未获取 deploymentId,响应: ${resp}")
+        logger.lifecycle("[Central] deploymentId: ${deploymentId}")
+        def pb2 = new ProcessBuilder('curl', '-s', '-S', '-u', "${tokenUser}:${tokenPass}",
+                '-X', 'POST', "https://central.sonatype.com/api/v1/publisher/deployment/${deploymentId}")
+        pb2.redirectErrorStream(true)
+        def proc2 = pb2.start()
+        def resp2 = proc2.inputStream.text
+        proc2.waitFor()
+        logger.lifecycle("[Central] publish 响应: ${resp2}")
+        if (proc2.exitValue() != 0) throw new GradleException("publish 失败(curl exit ${proc2.exitValue()}):\n${resp2}")
+    }
+}
+
